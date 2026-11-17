@@ -20,6 +20,9 @@ alone does not sweep existing threads; apply does, and startup/reload catches up
 Explicit sections and pinned state are preserved; hidden and archived threads
 are skipped. Moving a thread to no section makes it eligible again.
 
-Settings → Installed plugins → Thread Sections exposes `enabled` and `rules`.
-`rules` is a JSON object mapping project IDs to section IDs. The default is
-`{}`. `enabled=false` pauses all routing, including apply and startup catch-up.
+Settings → Installed plugins → Thread Sections provides project and section
+dropdowns, Add rule, inline destination edits, removal, and Preview/Move controls.
+The `enabled` setting pauses all routing, including apply and startup catch-up.
+Rules live in plugin KV storage; use the CLI or editor to change them. There is
+no JSON setting. For upgrades from 0.1, export rules before updating and restore
+with `set`; see the README.

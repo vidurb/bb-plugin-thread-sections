@@ -16,39 +16,47 @@ No rules are configured initially, so installing alone moves nothing.
 
 ## Configure
 
-Create your sections with BB's sidebar or `bb thread section create Work`.
-List available projects and sections, then set a rule by exact name or ID:
+Open **Settings → Installed plugins → Thread Sections**.
+
+1. Pick a project and its destination section, then click **Add rule**.
+Each rule shows the project's name beside its section. Change the section with
+its dropdown, or remove the rule with the remove button. Rules save immediately
+and sync across open windows. You can send several projects to the same section.
+
+Use **Preview** under **Sort existing threads** to see how many unsectioned
+threads match. Click **Move N threads** to apply the rules. Adding or changing
+a rule alone only affects new threads; threads already in a section keep their
+placement. Pause automatic filing with the switch above the editor.
+
+Create sections in BB's sidebar. Use **Refresh** in the editor after creating
+or renaming a project or section elsewhere. Unavailable targets are marked in
+the rule list so they can be repaired or removed.
+
+### Command line
+
+The CLI remains available for agents and scripts:
 
 ```sh
 bb thread-sections targets
 bb thread-sections set 'My Project' Work
 bb thread-sections list
-```
-
-Rules take effect immediately for newly created or unarchived threads.
-Names containing spaces must be quoted. Ambiguous names are rejected; use
-an ID instead. Rules store IDs so renaming a project or section keeps working.
-Sections must already exist; the plugin never creates them implicitly.
-
-To sort existing threads after adding rules:
-
-```sh
 bb thread-sections apply --dry-run
 bb thread-sections apply
+bb thread-sections remove 'My Project'
 ```
 
-Remove a rule with `bb thread-sections remove 'My Project'`. Removing a rule
-leaves already filed threads where they are. Every command supports `--json`.
+Names containing spaces must be quoted. Ambiguous names require an ID.
+Sections must already exist. Rules store IDs so renaming keeps working.
+Every command supports `--json`. Removing a rule leaves already filed threads
+where they are. Rules are stored privately on your BB server, separate from
+the plugin's public source repository.
 
-You can also edit **Automatically file threads** and **Project → section
-rules (JSON IDs)** in the plugin's settings. The rules field is a JSON object:
+### Upgrading from 0.1
 
-```json
-{"proj_example": "section-id"}
-```
-
-Disable **Automatically file threads** to pause routing and catch-up.
-Rules stay on your BB server, separate from the plugin's source repository.
+Version 0.2 replaces the JSON setting with the visual editor and stores rules
+in plugin storage. If you configured 0.1, save `bb thread-sections list --json`
+before upgrading, then recreate those mappings with the editor or
+`bb thread-sections set <project-id> <section-id>`. The enable switch is retained.
 
 ## Behavior
 
@@ -78,8 +86,8 @@ npm run typecheck
 bb plugin build .
 ```
 
-The tests use BB's public SDK fake-host harness and cover routing, settings,
-CLI validation, pagination and lifecycle events. CI checks tests, types and
+The tests use BB's public SDK fake-host and frontend harnesses. They cover
+routing, stored rules, RPC validation, pagination, lifecycle events and editor interactions. CI checks tests, types and
 the plugin build. Generated `dist/` and `node_modules/` are not committed.
 
 The source repository is public. No marketplace submission or release tag is

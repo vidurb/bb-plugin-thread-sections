@@ -1,16 +1,5 @@
 import type { BbPluginApi } from "@get-bb/plugin-sdk";
-import { z } from "zod";
-
-// Persist IDs so renaming projects or sections does not break rules.
-const rulesSchema = z.record(z.string().regex(/^proj_[\w-]+$/), z.string().min(1));
-const rulesTextSchema = z.string().max(64_000).refine((text) => {
-  try { return rulesSchema.safeParse(JSON.parse(text)).success; }
-  catch { return false; }
-}, 'Use a JSON object mapping project IDs to section IDs, e.g. {"proj_example":"section-id"}.');
-
-function parseRules(text: string): Record<string, string> {
-  return rulesSchema.parse(JSON.parse(text));
-}
+import { rpcContract, rulesSchema } from "./rpc.ts";
 
 function resolveTarget(items: { id: string; name: string }[], value: string, kind: string) {
   const exactId = items.find((item) => item.id === value);
@@ -25,11 +14,18 @@ function resolveTarget(items: { id: string; name: string }[], value: string, kin
 export default function plugin(bb: BbPluginApi) {
   const settings = bb.settings.define({
     enabled: { type: "boolean", label: "Automatically file threads", default: true },
-    rules: {
-      type: "string", label: "Project → section rules (JSON IDs)", default: "{}",
-      experimental_multiline: true, experimental_schema: rulesTextSchema,
-    },
+
   });
+  async function getConfig() {
+    const { enabled } = await settings.get();
+    const rules = rulesSchema.parse((await bb.storage.kv.get("rules")) ?? {});
+    return { enabled, rules };
+  }
+  async function saveRules(rules: Record<string, string>) {
+    await bb.storage.kv.set("rules", rulesSchema.parse(rules));
+    bb.rpc.experimental_invalidate(["rules"]);
+  }
+  settings.onChange(() => bb.rpc.experimental_invalidate(["rules"]));
   let disposed = false;
   let tail: Promise<unknown> = Promise.resolve();
   // Serialize sweeps, event handlers and rule edits within this generation.
@@ -42,9 +38,9 @@ export default function plugin(bb: BbPluginApi) {
 
   async function route(threadId: string, dryRun = false): Promise<boolean> {
     if (disposed) return false;
-    const config = await settings.get();
+    const config = await getConfig();
     if (!config.enabled) return false;
-    const rules = parseRules(config.rules);
+    const rules = config.rules;
     if (!Object.keys(rules).length) return false;
     // Re-read immediately before moving: the creation event may be stale.
     const thread = await bb.sdk.threads.get({ threadId });
@@ -61,10 +57,10 @@ export default function plugin(bb: BbPluginApi) {
   }
 
   async function apply(dryRun = false, signal?: AbortSignal) {
-    const config = await settings.get();
+    const config = await getConfig();
     const result = { matched: 0, moved: 0, failed: 0, dryRun };
     if (!config.enabled || disposed) return result;
-    for (const projectId of Object.keys(parseRules(config.rules))) {
+    for (const projectId of Object.keys(config.rules)) {
       // Finish paging before writes, since moving threads may change list order.
       const ids = new Set<string>();
       for (let offset = 0; !disposed && !signal?.aborted; offset += 100) {
@@ -94,6 +90,31 @@ export default function plugin(bb: BbPluginApi) {
   // Catch events missed while the plugin was unloaded. No polling or timers.
   bb.background.service("catch-up", { async start(signal) { await enqueue(() => apply(false, signal)); } });
 
+  bb.rpc.register(rpcContract, {
+    state: () => enqueue(async () => {
+      const [config, projects, sections] = await Promise.all([
+        getConfig(), bb.sdk.projects.list({ includePersonal: true }), bb.sdk.threadSections.list(),
+      ]);
+      return { ...config, projects: projects.map(({ id, name }) => ({ id, name })),
+        sections: sections.map(({ id, name }) => ({ id, name })) };
+    }),
+    setRule: ({ projectId, sectionId }) => enqueue(async () => {
+      const projects = await bb.sdk.projects.list({ includePersonal: true });
+      const sections = await bb.sdk.threadSections.list();
+      if (!projects.some((project) => project.id === projectId)) throw new Error("Project no longer exists. Refresh and choose another project.");
+      if (!sections.some((section) => section.id === sectionId)) throw new Error("Section no longer exists. Refresh and choose another section.");
+      await saveRules({ ...(await getConfig()).rules, [projectId]: sectionId });
+      return { saved: true as const };
+    }),
+    removeRule: ({ projectId }) => enqueue(async () => {
+      const rules = (await getConfig()).rules;
+      delete rules[projectId];
+      await saveRules(rules);
+      return { removed: true as const };
+    }),
+    apply: ({ dryRun }) => enqueue(() => apply(dryRun)),
+  });
+
   const usage = [
     "bb thread-sections targets [--json]",
     "bb thread-sections list [--json]",
@@ -118,8 +139,8 @@ export default function plugin(bb: BbPluginApi) {
       try {
         if (!command || command === "help" || command === "--help") return { exitCode: 0, stdout: usage };
         if (command === "list" && !values.length) {
-          const config = await settings.get();
-          return reply({ enabled: config.enabled, rules: parseRules(config.rules) });
+          const config = await getConfig();
+          return reply({ enabled: config.enabled, rules: config.rules });
         }
         if (command === "targets" && !values.length) {
           const [projects, sections] = await Promise.all([
@@ -131,12 +152,12 @@ export default function plugin(bb: BbPluginApi) {
         if ((command === "set" && values.length === 2) || (command === "remove" && values.length === 1)) {
           const projects = await bb.sdk.projects.list({ includePersonal: true });
           const projectId = resolveTarget(projects, values[0]!, "project");
-          const rules = parseRules((await settings.get()).rules);
+          const rules = (await getConfig()).rules;
           if (command === "set") {
             const sections = await bb.sdk.threadSections.list();
             rules[projectId] = resolveTarget(sections, values[1]!, "section");
           } else delete rules[projectId];
-          await settings.experimental_set({ rules: JSON.stringify(rules) });
+          await saveRules(rules);
           return reply({ rules });
         }
         if (command === "apply" && (values.length === 0 || (values.length === 1 && values[0] === "--dry-run"))) {
