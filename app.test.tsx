@@ -42,6 +42,8 @@ test("adds a named rule using dropdowns without JSON", async () => {
 test("edits a section inline and removes the rule", async () => {
   const { slot, writes } = await mount({ rules: { proj_one: "sec_work" } });
   fireEvent.change(slot.getByLabelText("Section for Website"), { target: { value: "sec_personal" } });
+  expect(writes).toEqual([]);
+  fireEvent.click(slot.getByRole("button", { name: "Save section for Website" }));
   await slot.findByText("Section updated.");
   expect(writes).toEqual([{ projectId: "proj_one", sectionId: "sec_personal" }]);
   fireEvent.click(slot.getByRole("button", { name: "Remove rule for Website" }));
@@ -73,22 +75,28 @@ test("disabled routing and missing sections have clear states", async () => {
   await waitFor(() => expect((slot.getByRole("button", { name: "Preview" }) as HTMLButtonElement).disabled).toBe(true));
 });
 
-test("previews existing threads before offering the move action", async () => {
-  const { slot, writes } = await mount({ rules: { proj_one: "sec_work" } });
-  fireEvent.click(slot.getByRole("button", { name: "Preview" }));
-  const move = await slot.findByRole("button", { name: "Move 2 threads" });
-  expect(writes).toEqual([{ dryRun: true }]);
-  fireEvent.click(move);
-  await slot.findByText("2 threads moved.");
-  expect(writes).toEqual([{ dryRun: true }, { dryRun: false }]);
+test("unavailable projects can only be removed; missing sections can be repaired", async () => {
+  const { slot, writes } = await mount({ rules: { proj_missing: "sec_work", proj_one: "sec_missing" } });
+  expect((slot.getByLabelText("Section for proj_missing") as HTMLSelectElement).disabled).toBe(true);
+  expect(slot.queryByRole("button", { name: "Save section for proj_missing" })).toBeNull();
+  expect(slot.getByText("This project is unavailable. Remove the rule.")).toBeTruthy();
+  expect(slot.getByText("This section is unavailable. Choose another section and save, or remove the rule.")).toBeTruthy();
+  fireEvent.change(slot.getByLabelText("Section for Website"), { target: { value: "sec_work" } });
+  fireEvent.click(slot.getByRole("button", { name: "Save section for Website" }));
+  await slot.findByText("Section updated.");
+  expect(writes).toEqual([{ projectId: "proj_one", sectionId: "sec_work" }]);
+  fireEvent.click(slot.getByRole("button", { name: "Remove rule for deleted project" }));
+  await slot.findByText("Rule removed. Existing threads stay where they are.");
 });
 
-test("edits a destination inline and removes the rule", async () => {
+test("refresh preserves preview for equal rules and clears it when rules change", async () => {
   const { slot, state } = await mount({ rules: { proj_one: "sec_work" } });
-  fireEvent.change(slot.getByRole("combobox", { name: "Section for Website" }), { target: { value: "sec_personal" } });
-  await slot.findByText("Section updated.");
-  expect(state.rules.proj_one).toBe("sec_personal");
-  fireEvent.click(slot.getByRole("button", { name: "Remove rule for Website" }));
-  await slot.findByText("Rule removed. Existing threads stay where they are.");
-  expect(state.rules).toEqual({});
+  fireEvent.click(slot.getByRole("button", { name: "Preview" }));
+  await slot.findByRole("button", { name: "Move 2 threads" });
+  fireEvent.click(slot.getByRole("button", { name: "Refresh" }));
+  await waitFor(() => expect(slot.getByRole("button", { name: "Move 2 threads" })).toBeTruthy());
+  state.rules.proj_one = "sec_personal";
+  await waitFor(() => expect((slot.getByRole("button", { name: "Refresh" }) as HTMLButtonElement).disabled).toBe(false));
+  fireEvent.click(slot.getByRole("button", { name: "Refresh" }));
+  await waitFor(() => expect(slot.queryByRole("button", { name: "Move 2 threads" })).toBeNull());
 });

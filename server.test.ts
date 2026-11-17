@@ -44,6 +44,9 @@ async function setup(config: { enabled?: boolean; rules?: string } = { rules }) 
 
 test("empty rules leave threads alone", async (t) => {
   const f = await setup({}); t.after(() => f.harness.lifecycle.dispose());
+  f.add("preinstall");
+  await f.harness.lifecycle.install();
+  assert.equal(f.harness.registrations.services.length, 0);
   await f.harness.behavior.emitThreadEvent("thread.created", { thread: f.add("empty") });
   assert.equal(f.updates.length, 0);
 });
@@ -77,15 +80,15 @@ test("re-reads stale event placement before moving", async (t) => {
   assert.equal(f.updates.length, 0);
 });
 
-test("dry-run and catch-up cover multiple pages without skipping moved rows", async (t) => {
+test("dry-run and explicit apply cover multiple pages without skipping moved rows", async (t) => {
   const f = await setup(); t.after(() => f.harness.lifecycle.dispose());
   for (let i = 0; i < 205; i++) f.add(`thread_${i}`);
   const preview = await f.harness.behavior.runCli(["apply", "--dry-run", "--json"]);
   assert.deepEqual(JSON.parse(preview.stdout!), { matched: 205, moved: 0, failed: 0, dryRun: true });
   assert.equal(f.updates.length, 0);
-  const service = f.harness.behavior.runService("catch-up");
-  await service.done;
+  await f.harness.behavior.runCli(["apply"]);
   assert.equal(f.updates.length, 205);
+  assert.equal(f.harness.inspection.sdk.callsTo("threadSections.list").length, 2);
 });
 
 test("settings changes take effect without reloading; disabled suppresses routing", async (t) => {
@@ -137,6 +140,82 @@ test("missing sections fail visibly and do not stop other rules", async (t) => {
   const result = await f.harness.behavior.runCli(["apply", "--json"]);
   assert.equal(result.exitCode, 1);
   assert.equal(JSON.parse(result.stdout!).failed, 1);
+  assert.equal(f.updates.length, 0);
+});
+
+test("project paging failures are reported and later projects still run", async (t) => {
+  const f = await setup({ rules: JSON.stringify({ proj_missing: "sec_work", proj_bad: "sec_work", proj_work: "sec_work" }) });
+  t.after(() => f.harness.lifecycle.dispose());
+  f.add("valid");
+  f.harness.sdk.stub("threads.list", async ({ projectId }) => {
+    if (projectId !== "proj_work") throw new Error(projectId === "proj_missing" ? "Project not found" : "Page unavailable");
+    return [...f.threads.values()];
+  });
+  const result = await f.harness.behavior.runCli(["apply", "--json"]);
+  assert.equal(result.exitCode, 1);
+  assert.deepEqual(JSON.parse(result.stdout!), { matched: 1, moved: 1, failed: 2, dryRun: false });
+  assert.equal(f.harness.logEntries.filter((entry) => entry.message.includes("Could not list threads")).length, 2);
+});
+
+test("install, upgrade, reload, pause and rule changes never sweep existing or missed threads", async (t) => {
+  const f = await setup({ rules: JSON.stringify({ proj_work: "sec_work" }) });
+  t.after(() => f.harness.lifecycle.dispose());
+  const old = f.add("old");
+  await f.harness.lifecycle.install();
+  assert.equal(f.harness.registrations.services.length, 0);
+  await f.harness.behavior.emitThreadEvent("thread.created", { thread: f.add("routed") });
+  f.threads.get("routed")!.sectionId = null; // deliberately unsectioned
+  await f.harness.behavior.setSettings({ enabled: false });
+  await f.harness.behavior.emitThreadEvent("thread.created", { thread: f.add("paused") });
+  const pausedReload = await f.harness.lifecycle.reload(plugin);
+  assert.equal((await pausedReload.harness.behavior.callRpc("state", null) as { enabled: boolean }).enabled, false);
+  assert.equal(f.updates.length, 1);
+  await pausedReload.harness.behavior.setSettings({ enabled: true });
+  f.sections.push({ ...f.sections[0]!, id: "sec_other", name: "Other" });
+  await pausedReload.harness.behavior.callRpc("setRule", { projectId: "proj_work", sectionId: "sec_other" });
+  f.add("missed"); // no event delivered while unloaded
+  const reloaded = await pausedReload.harness.lifecycle.reload(plugin);
+  t.after(() => reloaded.harness.lifecycle.dispose());
+  assert.equal(reloaded.harness.registrations.services.length, 0);
+  assert.equal(f.updates.length, 1);
+  assert.equal(old.sectionId, null);
+  const preview = await reloaded.harness.behavior.callRpc("apply", { dryRun: true }) as { matched: number };
+  assert.equal(preview.matched, 4);
+  await reloaded.harness.behavior.callRpc("apply", { dryRun: false });
+  assert.equal(f.updates.length, 5);
+});
+
+test("reads bypass a blocked sweep and disposal stops it before the next move", async () => {
+  const f = await setup();
+  f.add("first"); f.add("second");
+  let release!: () => void;
+  let entered!: () => void;
+  const blocked = new Promise<void>((resolve) => { release = resolve; });
+  const started = new Promise<void>((resolve) => { entered = resolve; });
+  f.harness.sdk.stub("threads.get", async ({ threadId }) => { entered(); await blocked; return f.threads.get(threadId)!; });
+  const sweep = f.harness.behavior.callRpc("apply", { dryRun: false });
+  await started;
+  const reads = Promise.all([f.harness.behavior.callRpc("state", null), f.harness.behavior.runCli(["list"]), f.harness.behavior.runCli(["targets"])]);
+  await Promise.race([reads, new Promise<never>((_, reject) => setTimeout(() => reject(new Error("reads blocked")), 500))]);
+  const dispose = f.harness.lifecycle.dispose();
+  release();
+  await Promise.all([sweep, dispose]);
+  assert.equal(f.updates.length, 0);
+});
+
+test("pausing during a sweep stops pending moves", async (t) => {
+  const f = await setup(); t.after(() => f.harness.lifecycle.dispose());
+  f.add("pending");
+  let release!: () => void;
+  let entered!: () => void;
+  const blocked = new Promise<void>((resolve) => { release = resolve; });
+  const started = new Promise<void>((resolve) => { entered = resolve; });
+  f.harness.sdk.stub("threads.get", async ({ threadId }) => { entered(); await blocked; return f.threads.get(threadId)!; });
+  const sweep = f.harness.behavior.callRpc("apply", { dryRun: false });
+  await started;
+  await f.harness.behavior.setSettings({ enabled: false });
+  release();
+  await sweep;
   assert.equal(f.updates.length, 0);
 });
 

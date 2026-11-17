@@ -18,7 +18,9 @@ export function RulesSettings() {
   const [error, setError] = useState<string | null>(null);
   const [notice, setNotice] = useState("");
   const [preview, setPreview] = useState<number | null>(null);
-  useEffect(() => { setPreview(null); }, [data?.rules, data?.enabled]);
+  const [drafts, setDrafts] = useState<Record<string, string>>({});
+  const rulesKey = JSON.stringify(Object.entries(data?.rules ?? {}).sort(([a], [b]) => a.localeCompare(b)));
+  useEffect(() => { setPreview(null); setDrafts({}); }, [rulesKey, data?.enabled]);
 
   async function run(action: () => Promise<void>) {
     setBusy(true); setError(null); setNotice("");
@@ -60,25 +62,25 @@ export function RulesSettings() {
         <p className="text-sm font-medium">Your threads, neatly sorted</p>
         <p className="mx-auto mt-1 max-w-sm text-sm text-muted-foreground">Choose a project and where its new threads should go. Several projects can share a section.</p>
       </div> : <ul className="divide-y">
-        {rules.map(([id, target]) => <li key={id} className="flex flex-wrap items-center gap-3 px-5 py-4">
+        {rules.map(([id, target]) => <li key={id} aria-busy={busy} className="flex flex-wrap items-center gap-3 px-5 py-4">
           <div className="flex min-w-0 flex-1 items-center gap-3">
             <span className="min-w-0 flex-1 truncate text-sm font-medium" title={projectName(id) ?? id}>{projectName(id) ?? "Deleted project"}</span>
             <Icon name="ArrowRight" className="size-4 shrink-0 text-muted-foreground" />
             <label className="min-w-0 flex-1"><span className="sr-only">Section for {projectName(id) ?? id}</span>
-              <select className={selectStyle} value={target} disabled={busy} onChange={(e) => {
-                const next = e.target.value;
-                void run(async () => { await rpc.call("setRule", { projectId: id, sectionId: next }); await query.refetch(); setNotice("Section updated."); });
-              }}>
+              <select className={selectStyle} value={drafts[id] ?? target} disabled={busy || !projectName(id)} onChange={(e) => setDrafts((current) => ({ ...current, [id]: e.target.value }))}>
                 {!sectionName(target) && <option value={target}>Section unavailable</option>}
                 {sections.map((s) => <option key={s.id} value={s.id}>{s.name}</option>)}
               </select>
             </label>
           </div>
+          {projectName(id) && <Button disabled={busy || !drafts[id] || drafts[id] === target} aria-label={`Save section for ${projectName(id)}`} onClick={() => void run(async () => {
+            await rpc.call("setRule", { projectId: id, sectionId: drafts[id]! }); await query.refetch(); setNotice("Section updated.");
+          })}>Save</Button>}
           <Button className="shrink-0 border-transparent text-muted-foreground hover:text-destructive" disabled={busy}
             aria-label={`Remove rule for ${projectName(id) ?? "deleted project"}`} onClick={() => void run(async () => {
               await rpc.call("removeRule", { projectId: id }); await query.refetch(); setNotice("Rule removed. Existing threads stay where they are.");
             })}><Icon name="Trash2" className="size-4" /><span className="sr-only">Remove</span></Button>
-          {(!projectName(id) || !sectionName(target)) && <p className="w-full text-xs text-destructive">This rule needs attention. Choose an available section or remove the rule.</p>}
+          {(!projectName(id) || !sectionName(target)) && <p className="w-full text-xs text-destructive">{!projectName(id) ? "This project is unavailable. Remove the rule." : "This section is unavailable. Choose another section and save, or remove the rule."}</p>}
         </li>)}
       </ul>}
       <form onSubmit={(event) => void addRule(event)} className="space-y-3 border-t bg-muted/20 px-5 py-4">
@@ -108,18 +110,18 @@ export function RulesSettings() {
       <div className="flex shrink-0 flex-wrap gap-2">
         {preview !== null && preview > 0 && <Button disabled={busy || !data.enabled} className="border-primary bg-primary text-primary-foreground hover:bg-primary/90" onClick={() => void run(async () => {
           const result = await rpc.call("apply", { dryRun: false });
-          setPreview(null); setNotice(`${result.moved} ${result.moved === 1 ? "thread" : "threads"} moved.${result.failed ? ` ${result.failed} could not be moved; check the plugin logs.` : ""}`);
+          setPreview(null); setNotice(`${result.moved} ${result.moved === 1 ? "thread" : "threads"} moved.${result.failed ? ` ${result.failed} threads or project rules failed; check the plugin logs.` : ""}`);
         })}>Move {preview} {preview === 1 ? "thread" : "threads"}</Button>}
         <Button disabled={busy || !data.enabled || !rules.length} onClick={() => void run(async () => {
           const result = await rpc.call("apply", { dryRun: true }); setPreview(result.matched);
-          setNotice(result.failed ? `${result.failed} threads could not be checked. Repair unavailable rules and try again.` : result.matched ? `${result.matched} ${result.matched === 1 ? "thread is" : "threads are"} ready to move.` : "All caught up. No threads need moving.");
-        })}>{busy ? "Working…" : "Preview"}</Button>
+          setNotice(result.failed ? `${result.failed} threads or project rules could not be checked. Check the plugin logs and repair unavailable rules.` : result.matched ? `${result.matched} ${result.matched === 1 ? "thread is" : "threads are"} ready to move.` : "All caught up. No threads need moving.");
+        })}>Preview</Button>
       </div>
     </div>
     {(error || query.error) && <p role="alert" className="rounded-lg border border-destructive/30 bg-destructive/5 px-4 py-3 text-sm text-destructive">{error ?? query.error?.message}</p>}
     <p role="status" aria-live="polite" className="text-sm text-muted-foreground">{notice}</p>
     <div className="flex items-center justify-between gap-3 text-xs text-muted-foreground">
-      <p>Changes save automatically. Existing section choices are preserved.</p>
+      <p>Save destination changes in each row. Existing section choices are preserved.</p>
       <Button className="min-h-7 border-transparent px-2 py-1 text-xs" disabled={busy || query.isFetching} onClick={() => void query.refetch()}>Refresh</Button>
     </div>
   </div>;

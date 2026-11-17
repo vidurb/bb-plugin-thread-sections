@@ -25,7 +25,8 @@ export default function plugin(bb: BbPluginApi) {
     await bb.storage.kv.set("rules", rulesSchema.parse(rules));
     bb.rpc.experimental_invalidate(["rules"]);
   }
-  settings.onChange(() => bb.rpc.experimental_invalidate(["rules"]));
+  let settingsVersion = 0;
+  settings.onChange(() => { settingsVersion++; bb.rpc.experimental_invalidate(["rules"]); });
   let disposed = false;
   let tail: Promise<unknown> = Promise.resolve();
   // Serialize sweeps, event handlers and rule edits within this generation.
@@ -36,43 +37,53 @@ export default function plugin(bb: BbPluginApi) {
   }
   bb.onDispose(async () => { disposed = true; await tail; });
 
-  async function route(threadId: string, dryRun = false): Promise<boolean> {
-    if (disposed) return false;
-    const config = await getConfig();
-    if (!config.enabled) return false;
-    const rules = config.rules;
+  async function route(threadId: string, dryRun = false, snapshot?: { rules: Record<string, string>; sections: Set<string>; stopped: () => boolean }): Promise<boolean> {
+    if (disposed || snapshot?.stopped()) return false;
+    const version = settingsVersion;
+    const config = snapshot ? null : await getConfig();
+    if (config && !config.enabled) return false;
+    const rules = snapshot?.rules ?? config!.rules;
     if (!Object.keys(rules).length) return false;
     // Re-read immediately before moving: the creation event may be stale.
     const thread = await bb.sdk.threads.get({ threadId });
     const sectionId = rules[thread.projectId];
     if (!sectionId || thread.sectionId !== null || thread.archivedAt !== null ||
         thread.deletedAt !== null || thread.visibility === "hidden") return false;
-    const sections = await bb.sdk.threadSections.list();
-    if (!sections.some((section) => section.id === sectionId)) {
+    const sections = snapshot?.sections ?? new Set((await bb.sdk.threadSections.list()).map((section) => section.id));
+    if (!sections.has(sectionId)) {
       throw new Error(`Rule for ${thread.projectId} points to missing section ${sectionId}; update or remove it.`);
     }
-    if (disposed) return false;
+    if (disposed || version !== settingsVersion || snapshot?.stopped()) return false;
     if (!dryRun) await bb.sdk.threads.update({ threadId, sectionId });
     return true;
   }
 
   async function apply(dryRun = false, signal?: AbortSignal) {
+    const version = settingsVersion;
     const config = await getConfig();
     const result = { matched: 0, moved: 0, failed: 0, dryRun };
     if (!config.enabled || disposed) return result;
+    const stopped = () => disposed || !!signal?.aborted || version !== settingsVersion;
+    const snapshot = { rules: config.rules, sections: new Set((await bb.sdk.threadSections.list()).map((section) => section.id)), stopped };
     for (const projectId of Object.keys(config.rules)) {
       // Finish paging before writes, since moving threads may change list order.
       const ids = new Set<string>();
-      for (let offset = 0; !disposed && !signal?.aborted; offset += 100) {
-        const page = await bb.sdk.threads.list({ projectId, archived: false,
-          unsectioned: true, limit: 100, offset, signal });
-        for (const thread of page) ids.add(thread.id);
-        if (page.length < 100) break;
+      try {
+        for (let offset = 0; !stopped(); offset += 100) {
+          const page = await bb.sdk.threads.list({ projectId, archived: false,
+            unsectioned: true, limit: 100, offset, signal });
+          for (const thread of page) ids.add(thread.id);
+          if (page.length < 100) break;
+        }
+      } catch (error) {
+        if (stopped()) return result;
+        result.failed++;
+        bb.log.warn(`Could not list threads for project ${projectId}: ${String(error)}`);
       }
       for (const id of ids) {
-        if (disposed || signal?.aborted) return result;
+        if (stopped()) return result;
         try {
-          if (await route(id, dryRun)) {
+          if (await route(id, dryRun, snapshot)) {
             result.matched++;
             if (!dryRun) result.moved++;
           }
@@ -87,17 +98,14 @@ export default function plugin(bb: BbPluginApi) {
 
   bb.events.on("thread.created", ({ thread }) => enqueue(async () => { await route(thread.id); }));
   bb.events.on("thread.unarchived", ({ thread }) => enqueue(async () => { await route(thread.id); }));
-  // Catch events missed while the plugin was unloaded. No polling or timers.
-  bb.background.service("catch-up", { async start(signal) { await enqueue(() => apply(false, signal)); } });
-
   bb.rpc.register(rpcContract, {
-    state: () => enqueue(async () => {
+    state: async () => {
       const [config, projects, sections] = await Promise.all([
         getConfig(), bb.sdk.projects.list({ includePersonal: true }), bb.sdk.threadSections.list(),
       ]);
       return { ...config, projects: projects.map(({ id, name }) => ({ id, name })),
         sections: sections.map(({ id, name }) => ({ id, name })) };
-    }),
+    },
     setRule: ({ projectId, sectionId }) => enqueue(async () => {
       const projects = await bb.sdk.projects.list({ includePersonal: true });
       const sections = await bb.sdk.threadSections.list();
@@ -131,7 +139,7 @@ export default function plugin(bb: BbPluginApi) {
       { name: "remove", summary: "Remove a project's rule", usage: usage.split("\n")[3]! },
       { name: "apply", summary: "File existing unsectioned threads", usage: usage.split("\n")[4]! },
     ],
-    run: (argv) => enqueue(async () => {
+    run: async (argv) => {
       const json = argv.includes("--json");
       const args = argv.filter((arg) => arg !== "--json");
       const [command, ...values] = args;
@@ -149,7 +157,7 @@ export default function plugin(bb: BbPluginApi) {
           return reply({ projects: projects.map(({ id, name }) => ({ id, name })),
             sections: sections.map(({ id, name }) => ({ id, name })) });
         }
-        if ((command === "set" && values.length === 2) || (command === "remove" && values.length === 1)) {
+        if ((command === "set" && values.length === 2) || (command === "remove" && values.length === 1)) return await enqueue(async () => {
           const projects = await bb.sdk.projects.list({ includePersonal: true });
           const projectId = resolveTarget(projects, values[0]!, "project");
           const rules = (await getConfig()).rules;
@@ -159,13 +167,13 @@ export default function plugin(bb: BbPluginApi) {
           } else delete rules[projectId];
           await saveRules(rules);
           return reply({ rules });
-        }
+        });
         if (command === "apply" && (values.length === 0 || (values.length === 1 && values[0] === "--dry-run"))) {
-          const result = await apply(values[0] === "--dry-run");
+          const result = await enqueue(() => apply(values[0] === "--dry-run"));
           return { ...reply(result), exitCode: result.failed ? 1 : 0 };
         }
         return { exitCode: 1, stderr: usage };
       } catch (error) { return { exitCode: 1, stderr: String(error) }; }
-    }),
+    },
   });
 }

@@ -5,7 +5,6 @@ Thread Sections applies project defaults without replacing your thread list.
 
 - One default section per project, with several projects able to share a section.
 - Automatic filing when a thread is created or unarchived.
-- A startup catch-up sweep for threads created while the plugin was off.
 - Preservation of explicit section placement and pinned state.
 - A visual rule editor with project and section dropdowns, inline changes and remove controls.
 - A preview of existing threads before applying rules.
@@ -13,12 +12,13 @@ Thread Sections applies project defaults without replacing your thread list.
 ## How it works
 
 Open the plugin's settings, choose a project and section, and click Add rule.
-Rules save automatically and sync across windows. You can change a destination
-inline or remove a rule. Unavailable projects or sections are marked clearly.
+Rules sync across windows. Change a destination inline and click Save, or
+remove a rule. Unavailable projects or sections are marked clearly.
 
 Use Preview to count eligible existing threads, then Move threads to apply your
 rules. Hidden and archived threads are skipped. A thread manually moved out of
-every section becomes eligible again. Installing with empty rules moves nothing.
+every section becomes eligible for an explicit move. Threads missed while the
+plugin is unloaded need an explicit move. Installing with empty rules moves nothing.
 
 The `bb thread-sections` CLI supports listing targets, setting and removing
 rules, and previewing or applying them for agents and scripts.
